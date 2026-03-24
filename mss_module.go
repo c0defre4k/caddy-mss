@@ -2,6 +2,7 @@ package mssmodule
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -10,20 +11,23 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"golang.org/x/sys/unix"
+	"go.uber.org/zap"
 )
 
-// Define a private type for the context key to avoid collisions
 type mssKeyType struct{}
+type connKeyType struct{}
 
 var mssKey mssKeyType
+var connKey connKeyType
 
 func init() {
 	caddy.RegisterModule(MSSMiddleware{})
 	httpcaddyfile.RegisterHandlerDirective("mss_header", parseCaddyfile)
 }
 
-type MSSMiddleware struct{}
+type MSSMiddleware struct {
+	logger *zap.Logger
+}
 
 func (MSSMiddleware) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -32,63 +36,102 @@ func (MSSMiddleware) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets up the connection context callback
+// unwrapConn extracts the underlying TCP connection from TLS or other wrappers
+func unwrapConn(c net.Conn) *net.TCPConn {
+	// Try to unwrap TLS
+	if tlsConn, ok := c.(*tls.Conn); ok {
+		c = tlsConn.NetConn()
+	}
+
+	// Now check if it's TCP
+	if tcpConn, ok := c.(*net.TCPConn); ok {
+		return tcpConn
+	}
+
+	return nil
+}
+
 func (m *MSSMiddleware) Provision(ctx caddy.Context) error {
-	// Find the parent HTTP app to register our context modifier
-	// This is the "Modern Way" mentioned in the deprecation notice
+	m.logger = ctx.Logger(m)
+	m.logger.Info("MSSMiddleware provisioning started")
+
 	app, err := ctx.App("http")
 	if err != nil {
+		m.logger.Error("failed to get HTTP app", zap.Error(err))
 		return err
 	}
-	server := app.(*caddyhttp.App).Servers
 
-	// Register a callback for ALL servers in this app
-	for _, srv := range server {
+	server := app.(*caddyhttp.App).Servers
+	m.logger.Info("registering connection context", zap.Int("server_count", len(server)))
+
+	for name, srv := range server {
+		m.logger.Info("registering for server", zap.String("server_name", name))
+
 		srv.RegisterConnContext(func(ctx context.Context, c net.Conn) context.Context {
+			// Store the connection itself for later use
+			ctx = context.WithValue(ctx, connKey, c)
+
 			var mss int
-			if tc, ok := c.(*net.TCPConn); ok {
-				raw, _ := tc.SyscallConn()
-				raw.Control(func(fd uintptr) {
-					mss, _ = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_MAXSEG)
-				})
+			tc := unwrapConn(c)
+			if tc != nil {
+				var err error
+				mss, err = getMSS(tc, m.logger)
+				if err != nil {
+					m.logger.Error("getMSS failed in RegisterConnContext", zap.Error(err))
+				} else if mss > 0 {
+					m.logger.Info("MSS extracted in RegisterConnContext", zap.Int("mss", mss))
+				} else {
+					m.logger.Warn("MSS is zero in RegisterConnContext")
+				}
+			} else {
+				m.logger.Warn("Could not unwrap to TCP connection", zap.String("type", fmt.Sprintf("%T", c)))
 			}
-			// Inject the MSS directly into the context
+
 			return context.WithValue(ctx, mssKey, mss)
 		})
 	}
+
+	m.logger.Info("MSSMiddleware provisioning complete")
 	return nil
 }
 
 func (m MSSMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// Retrieve the MSS from the context we populated in RegisterConnContext
-	if mss, ok := r.Context().Value(mssKey).(int); ok && mss > 0 {
+	mss, ok := r.Context().Value(mssKey).(int)
+
+	if !ok || mss == 0 {
+		if conn, ok := r.Context().Value(connKey).(net.Conn); ok {
+			tc := unwrapConn(conn)
+			if tc != nil {
+				var err error
+				mss, err = getMSS(tc, m.logger)
+				if err != nil {
+					m.logger.Error("getMSS failed in ServeHTTP", zap.Error(err))
+				} else {
+					m.logger.Info("MSS extracted in ServeHTTP", zap.Int("mss", mss))
+				}
+			}
+		}
+	}
+
+	if mss > 0 {
 		r.Header.Set("X-Client-MSS", fmt.Sprintf("%d", mss))
 	}
+
 	return next.ServeHTTP(w, r)
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (m *MSSMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	d.Next() // consume directive name
-
-	// require an argument
-	// if !d.NextArg() {
-	// 	return d.ArgErr()
-	// }
-
-	// store the argument
-	// m.Output = d.Val()
+	d.Next()
 	return nil
 }
 
-// parseCaddyfile unmarshals tokens from h into a new Middleware.
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m MSSMiddleware
 	err := m.UnmarshalCaddyfile(h.Dispenser)
 	return m, err
 }
 
-// Interface guards
 var (
 	_ caddy.Provisioner           = (*MSSMiddleware)(nil)
 	_ caddyhttp.MiddlewareHandler = (*MSSMiddleware)(nil)
